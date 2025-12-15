@@ -1,216 +1,103 @@
-1.2 In-Scope / Out-of-Scope
+This design document captures the logic, architecture, and safety protocols of the **Prisma Cloud Auto-Defender** solution. You can present this directly to leadership or your Change Control Board (CCB).
 
-In scope:
+---
 
-Deployment of DSPM Orchestrator(s) in AWS (in one or more accounts).
+#Technical Design Document: Prisma Cloud Auto-Defender**Version:** 2.0
+**Status:** Ready for Deployment
+**Owner:** Cloud Security Engineering
+**Target Service:** AWS Lambda (Serverless)
 
-Establishing IAM roles / permissions (read-only, scanner roles) in target AWS accounts.
+---
 
-Network connectivity (VPCs, peering, NAT, security groups).
+##1. Executive SummaryThis document outlines the automated solution for deploying the **Prisma Cloud Serverless Defender** across our AWS Lambda estate.
 
-Configuration of data source integrations (S3, RDS, Redshift, etc.).
+**The Problem:** Manually attaching security layers to hundreds of Lambda functions is unscalable, prone to human error, and risky (potential to break applications).
+**The Solution:** An intelligent, automated audit-and-remediate script that scans for unprotected functions and attaches the Prisma Defender **only** when safe to do so.
+**Business Value:**
 
-Enabling required logging and data flow (CloudTrail, CloudWatch, etc.).
+* **100% Audit Coverage:** Continuous hourly scanning of all regional functions.
+* **Zero Downtime:** "Do No Harm" logic prevents breaking production apps by skipping risky configurations (e.g., low memory, near-timeout).
+* **Operational Efficiency:** Eliminates manual security patching for serverless.
 
-Establishing baseline security, monitoring, alerting, and operational procedures.
+---
 
-Documentation, testing, knowledge transfer.
+##2. Solution ArchitectureThe solution utilizes a "Manager-Worker" pattern entirely within AWS Serverless infrastructure to minimize maintenance.
 
-Out of scope (for first version):
+###Core Components1. **EventBridge Scheduler:** Triggers the audit workflow hourly (`cron(0 * * * ? *)`).
+2. **Auto-Defender Lambda:** The central "Manager" function containing the logic.
+* **Runtime:** Python 3.11
+* **Permissions:** Least Privilege IAM Role (See Section 6).
 
-Deployment in non-AWS clouds (unless multi-cloud is a later phase).
 
-Deep remediation automation (beyond detection and alerting).
+3. **Target Lambdas:** The application functions that require protection.
+4. **Prisma Cloud Layer:** The immutable security artifact published by Palo Alto Networks/Prisma.
 
-Custom classifier creation (though may be enabled later).
+---
 
-Integration with third-party ticketing / orchestration (unless explicitly requested).
+##3. Workflow & Logic (The "Risk Engine")The script does not blindly apply security. It uses a **Risk Assessment Engine** (`assess_risk()`) to validate every function before modification.
 
-2. Architecture & Components
+###Phase 1: Discovery* Script scans targeted AWS Regions (e.g., `us-east-1`, `us-west-2`).
+* Filters for functions that are **not** currently protected (missing Layer or Environment Variables).
 
-From public documentation, DSPM in AWS typically comprises the following:
+###Phase 2: Risk Assessment (Go/No-Go)Every candidate function must pass **five safety checks** to be eligible for auto-protection:
 
-2.1 DSPM Components (AWS)
+| Check | Criteria | Rationale |
+| --- | --- | --- |
+| **1. Package Type** | `Zip` only | **Container Images** cannot accept Layers via API; they must be secured at build time (Dockerfile). |
+| **2. Architecture** | `x86_64` only | Current Prisma Layers are x86-optimized. Forcing them onto **ARM64 (Graviton)** functions causes immediate crash. |
+| **3. Runtime** | Python/Node.js | Only runtimes compatible with the `AWS_LAMBDA_EXEC_WRAPPER` method are supported. |
+| **4. Memory Headroom** | `> 256MB` | Defender agent requires ~30-70MB RAM. Functions with default **128MB** are at high risk of **OOM (Out of Memory)** crashes. |
+| **5. Timeout Buffer** | `< 870s` | AWS hard timeout is 900s (15 min). If a function runs >14m 30s, adding Defender latency will cause **Timeouts**. |
 
-Orchestrator: Deployed in AWS (e.g. EC2) within a “security / tooling” account or in each monitored account. It performs scanning and classification. 
-docs.dig.security
-+2
-docs.prismacloud.io
-+2
+###Phase 3: RemediationIf **all** checks pass:
 
-Read-Only Permissions / IAM Role: In each monitored AWS account, a least-privilege IAM role that allows DSPM to enumerate AWS resources (S3 buckets, databases, etc.) and ingest metadata. 
-docs.dig.security
-+2
-docs.prismacloud.io
-+2
+1. **Update Config:** Appends the Prisma Layer ARN to the function.
+2. **Inject Wrapper:** Adds `AWS_LAMBDA_EXEC_WRAPPER` environment variable.
+3. **Tagging:** (Optional) Adds a tag `SecurityProtected: True` for tracking.
 
-Scanner Permissions / IAM Role: For accounts where scanning of unmanaged assets is required, roles with required permissions to access storage volumes, DB engine metadata, or file systems. 
-docs.dig.security
-+3
-docs.dig.security
-+3
-docs.prismacloud.io
-+3
+---
 
-Networking / VPC / NAT / Peering: The Orchestrator must have network connectivity to target accounts and possibly to on-prem or file shares. Use of NAT, peering, or public egress (Elastic IP) is required. 
-docs.prismacloud.io
-+2
-docs.prismacloud.io
-+2
+##4. Technical Limitations & ExclusionsThe following scenarios are **out of scope** for this automation and require manual or CI/CD-based remediation.
 
-Logging & Event Ingestion: Enable CloudTrail, CloudWatch, S3, or other logs so that DSPM’s DDR engine can detect anomalous data events. 
-docs.dig.security
-+3
-docs.dig.security
-+3
-docs.prismacloud.io
-+3
+###4.1. Container Images* **Limitation:** Lambda functions deployed as Docker containers cannot use Lambda Layers.
+* **Impact:** Automation skips these functions.
+* **Remediation:** DevOps teams must add `COPY --from=twistlock/defender /usr/local/bin/defender` to their Dockerfiles.
 
-Secret Management / Credential Storage: Use AWS Secrets Manager or parameter store to store credentials (e.g. for on-prem file share, database access) securely. 
-docs.prismacloud.io
-+1
+###4.2. ARM64 (Graviton) Architectures* **Limitation:** The standard Prisma Defender Layer is incompatible with ARM64 instruction sets.
+* **Impact:** Automation skips `arm64` functions to prevent `Exec format error` crashes.
+* **Remediation:** Migrate function to x86_64 OR wait for Prisma ARM64 Layer support.
 
-Connectivity to External / On-Prem File Shares / Datastores (if required): For scenarios where file shares or other non-cloud assets are in scope. 
-docs.prismacloud.io
-+1
+###4.3. High-Utilization Functions (Edge Cases)* **Limitation:** Functions running at >95% memory or timeout utilization.
+* **Impact:** Automation skips these to prevent performance degradation.
+* **Remediation:** Application owners must optimize code or increase quotas before security can be applied.
 
-2.2 Deployment Topologies & Options
+---
 
-Single Orchestrator vs multiple per region.
+##5. Security Specifications###5.1. IAM Least PrivilegeThe automation runs with a highly scoped IAM Role.
 
-Orchestrator placed in a dedicated Security / Tooling AWS account vs in each monitored account.
+* **Allowed:** `lambda:ListFunctions`, `lambda:GetFunctionConfiguration` (Read-only on *)
+* **Restricted Write:** `lambda:UpdateFunctionConfiguration` is restricted by Condition keys (if enabled) or Account ID boundaries.
+* **Denied:** The script **cannot** modify function code (`UpdateFunctionCode`), preventing it from injecting malicious business logic.
 
-Use of cross-account IAM trust (delegation) to allow scanning from central Orchestrator.
+###5.2. Audit Trail* All actions (Skips, Updates, Errors) are logged to **Amazon CloudWatch Logs**.
+* **Log Level:** `INFO` for general ops, `WARNING` for skipped risks, `ERROR` for API failures.
 
-Use of VPC peering or Transit Gateway for network connectivity across accounts / regions.
+---
 
-Use of public egress (Elastic IP / NAT Gateway) for Orchestrator to communicate with DSPM backend or external services (if needed). 
-docs.prismacloud.io
-+1
+##6. Operational Roadmap###Deployment Strategy1. **Day 0 (Dry Run):** Deploy with `DRY_RUN = True`. Review CloudWatch logs to see which functions *would* be protected and which are skipped.
+2. **Day 1 (Tag-Based Rollout):** Deploy with IAM Policy Condition `aws:ResourceTag/SecurityScan = "true"`. Only protect specific test functions.
+3. **Day 7 (General Availability):** Remove IAM Condition. Automation protects all eligible functions hourly.
 
-2.3 Data Flow & Control Flow
+###Recovery Plan (Rollback)If the Defender causes issues on a specific function:
 
-Orchestrator invokes AWS APIs via IAM roles in target accounts to enumerate and fetch metadata of managed assets.
+1. **Immediate:** Manually remove the Layer and `AWS_LAMBDA_EXEC_WRAPPER` variable via AWS Console.
+2. **Prevention:** Add the function name to an `EXCLUSION_LIST` in the script configuration to prevent re-attachment.
 
-For unmanaged assets (e.g. DB on EC2), Orchestrator connects to volumes / instances (with scanner role) to scan content (in a read-only mode) and apply classification.
+---
 
-Classification results, metadata, and findings are sent (only metadata, no raw data) to the DSPM backend (hosted by Prisma) or collection service.
-
-DSPM dashboards, alerts, risk scoring, etc., operate on those metadata and classification results.
-
-DDR accesses logs / event streams (CloudTrail, S3 events, etc.) to detect anomalies or exfiltration patterns.
-
-3. Requirements & Prerequisites
-
-Below is a consolidated requirements checklist.
-
-Category	Requirement	Notes / Comments
-AWS Accounts Structure	A tooling / security account (or designated account) to host Orchestrator	Centralized or per account model, depending on scale
-IAM & Permissions	Creation of IAM roles in monitored accounts: read-only and scanner roles	Use least privilege; limit permissions. DSPM only needs metadata, not write access. 
-docs.prismacloud.io
-+2
-docs.prismacloud.io
-+2
-
-IAM Trust / Delegation	Cross-account trust so Orchestrator account can assume roles in target accounts	
-VPC & Networking	VPC for Orchestrator with required subnet(s), NAT, routing tables, IGW/EIP or peering	If on-prem / external connectivity is needed, set up peering/NAT etc. 
-docs.prismacloud.io
-+2
-docs.prismacloud.io
-+2
-
-Security Groups / NACLs	Allow outbound connectivity (for metadata upload, control plane) and inbound if management access is needed	Use strict rules
-NAT / Internet Egress	If Orchestrator needs to talk to DSPM backend, require egress (NAT with public IP) or use proxy	
-Logging / Monitoring	Enable CloudTrail, S3 access logs, CloudWatch, etc. in monitored accounts	Required for DDR and auditing. 
-docs.dig.security
-+1
-
-Secrets Management	Use AWS Secrets Manager or KMS to store credentials (for DBs, file shares)	When connecting to on-prem or file shares, password storage needed. 
-docs.prismacloud.io
-+1
-
-OS / Instance Requirements	Orchestrator EC2 instance sizing, OS, disk/io, capacity planning	Must meet performance for scanning workloads.
-Network Connectivity to Data Sources	If databases, file shares, or other data stores are in private subnets or on-prem, ensure connectivity (VPN, Direct Connect, VPC peering)	
-Security / Compliance	Ensure encrypted in transit, endpoint security, patching	
-High Availability / DR	Plan redundancy for Orchestrator (multi-AZ) and backup / recovery strategy	
-Testing & Validation	Plan for staging environment, test scans, validate results	
-Access Control / RBAC	Define user roles in DSPM console (administrators, data owners, auditors)	
-Scalability & Growth	Plan for adding new AWS accounts, future cloud providers, increased data volumes	
-
-Additionally, the official Prisma docs note that for file shares, DSPM requires a user account (e.g. in AD) and network connectivity between the orchestrator and file share systems (via internet / peering). 
-docs.prismacloud.io
-+1
-
-4. Deployment Steps (High Level)
-
-Here's a proposed stepwise plan. In the Word deliverable you can have more narrative; in Excel you can have a project plan with timelines, dependencies, owners.
-
-Step	Description	Deliverable / Output	Dependencies / Prereqs
-1	Kickoff & Requirements Gathering	Finalized scope, list of AWS accounts, data sources, connectivity maps	Stakeholder inputs
-2	AWS Account Setup & Networking	Create VPC, subnets, NAT / EIP or peering, routing, security groups	Networking team input
-3	Instance Provisioning	Provision EC2 instance(s) for Orchestrator in designated account	IAM, networking in place
-4	IAM Role Setup in Monitored Accounts	Create cross-account IAM roles (read-only, scanner) with trust policies	Access to target accounts
-5	Orchestrator Installation / Registration	Install or enable DSPM Orchestrator, register it with DSPM platform	Access to DSPM portal / license
-6	Secrets / Credentials Setup	Configure AWS Secrets Manager or other secret stores for DB / file share credentials	Access / accounts ready
-7	Configure Data Sources	In DSPM console, onboard AWS accounts, set up connectors/integrations for S3, RDS, etc.	IAM roles active, network ready
-8	Run Initial Discovery / Scan	Execute full scan, classify data, assess baseline	Monitor performance, logs
-9	Enable DDR / Monitoring	Hook up event sources (CloudTrail, S3 logs), validate anomaly detection	Logging enabled
-10	Validate & Tune	Validate scan results, tune classifiers, prune false positives, refine roles	Security / data owner review
-11	Set up Alerts / Notifications	Configure thresholds, alerts, dashboards, integration to SIEM / ticketing	DSPM capabilities / APIs
-12	Operational Readiness / Handover	Document runbooks, backup, DR, training, support process	Completed deployment
-13	Rollout to Additional Accounts / Regions	Add new accounts, scale scanning and orchestration	Experience / tweaks
-
-You may break these further into sub-tasks, dates, owners, etc., in Excel.
-
-5. Risks & Considerations
-
-Network latency / bandwidth: Scanning large datasets across VPCs / accounts could incur performance or network bottlenecks.
-
-IAM misconfiguration: Granting overly broad permissions is a risk; ensuring least privilege is critical.
-
-Data leakage / privacy: Only metadata should leave customer environment — ensure no raw data is exfiltrated.
-
-Scaling & performance: As data grows, the Orchestrator may need resource tuning or horizontal scaling.
-
-Compatibility & connectivity: On-prem file shares, legacy DBs, or databases in isolated networks may need special connectivity (VPN, Direct Connect).
-
-DR / backup: Orchestrator state, secrets, configurations must be backed up and recoverable.
-
-Operational burden: Ongoing maintenance, patching, classifier updates, false positive tuning.
-
-Cost management: EC2, data transfer, storage costs must be monitored.
-
-6. Proposed Document Structure
-Word Document (Design & Narrative)
-
-Introduction / Purpose
-
-Scope, Objectives, In/Out of Scope
-
-Logical Architecture & Components
-
-Data Flow Diagrams
-
-Detailed Requirements & Constraints
-
-Deployment Plan & Phases
-
-Risks, Mitigations, Assumptions
-
-Operational / Support Plan & Next Steps
-
-Appendices (e.g. AWS account mappings, connectivity diagram)
-
-Excel Workbook
-
-Tab 1: Project Plan / Gantt (Steps, Start/End, Duration, Owner, Dependencies)
-
-Tab 2: Requirement Checklist / Traceability (Requirement, Status, Owner)
-
-Tab 3: IAM Role Matrix (account, role name, permissions, trust relationships)
-
-Tab 4: Network / VPC Design (VPCs, subnets, peering, NAT, routing)
-
-Tab 5: Data Sources Onboarding (account, service, connector status, issues)
-
-Tab 6: Risks / Mitigations (Risk, Likelihood, Impact, Mitigation, Owner)
+##7. Configuration Reference (Script Variables)| Variable | Recommended Value | Description |
+| --- | --- | --- |
+| `MAX_LAYERS` | `5` | AWS Hard limit. |
+| `MIN_MEMORY_MB` | `256` | Safety floor for memory. |
+| `TIMEOUT_BUFFER_SEC` | `30` | Safety buffer for execution time. |
+| `ZIPPED_SIZE_THRESHOLD` | `70 MB` | Prevents hitting unzipped code size limits. |
