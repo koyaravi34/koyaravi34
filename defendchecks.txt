@@ -1,0 +1,85 @@
+Project: Serverless Security Automation (Zero-Impact Protocol)
+Version: 4.0 (Final Release) | Risk Level: Low | Impact: Non-Intrusive
+
+1. Executive Summary
+The goal of this automation is to achieve 100% security coverage across our AWS Lambda estate without causing operational disruption. To ensure "Zero Impact" on production applications, we have implemented a 10-Point Safety Funnel.
+
+This protocol strictly adheres to a "Do No Harm" philosophy: If a function shows even minor signs of instability or incompatibility, it is skipped and flagged for manual review rather than automatically patched.
+
+2. The Evaluation Logic (Safety Funnel)
+Visualizing the decision tree used by the automation engine. A function must pass ALL gates to be protected.
+
+3. Deep Dive: The 10-Point Safety Checklist
+The following table details every check performed by the assess_risk_deep_dive() engine.
+
+#,Check Name,The Risk (Why we check),Evaluation Logic,Action if Failed
+1,Immutable Package,Container Images cannot be modified via API. Attempting to add a Layer causes an AWS Error.,if PackageType == 'Image',"SKIP (Log: ""Requires Dockerfile update"")"
+2,Architecture Compat,Prisma Defender (v32.x) binaries are compiled for x86_64. They crash immediately on ARM64 (Graviton).,if 'arm64' in Architectures,"SKIP (Log: ""ARM64 Incompatible"")"
+3,Runtime Support,Only specific runtimes support the EXEC_WRAPPER method safely.,"if Runtime not in ['python3.x', 'node18.x'...]","SKIP (Log: ""Unsupported Runtime"")"
+4,Memory Headroom,Defender agent adds ~30-50MB overhead. Functions with 128MB risk OOM (Out of Memory) crashes.,if MemorySize < 256,"SKIP (Log: ""High Risk - OOM"")"
+5,Timeout Buffer,"AWS Hard Limit is 15 mins. If function runs for 14m 50s, adding 1s latency causes Timeout.",if Timeout > (900 - 30),"SKIP (Log: ""Timeout too close to limit"")"
+6,Env Var Quota,"AWS limits Env Vars to 4KB. If full, adding TW_POLICY causes deployment failure.",if (current_size + new_vars) > 4096,"SKIP (Log: ""Env Var Quota Full"")"
+7,VPC Black Hole,VPC functions without NAT Gateway cannot reach Prisma Console. Defender will hang/timeout.,if VpcConfig and not HasNatGateway,"WARN (Log: ""VPC Detected - Verify NAT"")"
+8,SnapStart Conflict,Java SnapStart freezes the init phase. Modifying layers breaks the snapshot restoration logic.,if SnapStart != 'None',"SKIP (Log: ""SnapStart Enabled"")"
+9,Provisioned Concurrency,"Modifying layers destroys ""Warm"" instances, causing Cold Start spikes and Re-billing.",if ProvisionedConcurrencyConfigs exists,"SKIP (Log: ""Provisioned Concurrency Active"")"
+10,Stability History,"If a function was Throttled recently, it is under stress. We do not touch stressed systems.",if Throttles_24h > 0,"SKIP (Log: ""Unstable - Recently Throttled"")"
+
+
+4. Operational Use Cases (Scenario Walkthrough)
+How the script handles specific "Real World" scenarios:
+
+✅ Scenario A: "The Standard Microservice"
+Profile: Python 3.11, 512MB RAM, 30s Timeout, No VPC.
+
+Evaluation: Passes all 10 checks.
+
+Result: PROTECTED. Layer added, Env Vars injected.
+
+⚠️ Scenario B: "The Massive Monolith"
+Profile: Node.js 18, 10GB RAM, 15 min Timeout (Data Processing).
+
+Evaluation: Fails Check #5 (Timeout Buffer).
+
+Result: SKIPPED.
+
+Reason: Adding the Defender might push execution to 15m 01s, killing the job.
+
+🚫 Scenario C: "The Legacy Container"
+Profile: Python 3.8 deployed as Docker Image.
+
+Evaluation: Fails Check #1 (Package Type).
+
+Result: SKIPPED.
+
+Reason: Immutable. Security must be baked into the Dockerfile by DevOps.
+
+💸 Scenario D: "The High-Frequency Trader"
+Profile: Python 3.9, Provisioned Concurrency set to 100 (Warm instances).
+
+Evaluation: Fails Check #9.
+
+Result: SKIPPED.
+
+Reason: Protecting this would destroy 100 warm instances instantly, causing a latency spike for live traffic.
+
+5. Recovery & Governance
+Rollback Plan
+If a protected function exhibits issues (Latency/Error):
+
+Immediate Action: Manually remove the twistlock-defender Layer and AWS_LAMBDA_EXEC_WRAPPER variable via AWS Console.
+
+Permanent Fix: Add the function name to the EXCLUSION_LIST in the script configuration.
+
+Audit Trail
+Success: Logged as [INFO] 🚀 PROTECTED: function_name
+
+Skip: Logged as [WARN] 🚫 SKIPPED: function_name - Reason
+
+Error: Logged as [ERROR] ❌ AWS Update Failed: error_message
+
+6. Next Steps for Leadership
+Approve Dry Run: Run the script in DRY_RUN = True mode to generate an "Audit Report" of our current landscape.
+
+Review Skips: Identify how many functions are "High Risk" (e.g., Low Memory) and assign tickets to App Teams to upgrade them (e.g., "Please bump memory to 256MB").
+
+Enable Automation: Once risks are remediated, enable the Hourly Schedule.
