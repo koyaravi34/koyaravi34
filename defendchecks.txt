@@ -83,3 +83,15 @@ Approve Dry Run: Run the script in DRY_RUN = True mode to generate an "Audit Rep
 Review Skips: Identify how many functions are "High Risk" (e.g., Low Memory) and assign tickets to App Teams to upgrade them (e.g., "Please bump memory to 256MB").
 
 Enable Automation: Once risks are remediated, enable the Hourly Schedule.
+
+#,Check Name,The Risk (Why we check),Evaluation Logic,Action if Failed
+1,Immutable Package,Container Images cannot be modified via API. Attempting to add a Layer causes an AWS Error.,if PackageType == 'Image',"SKIP (Log: ""Requires Dockerfile update"")"
+2,Architecture Compat,Prisma Defender (v32.x) binaries are compiled for x86_64. They crash immediately on ARM64 (Graviton).,if 'arm64' in Architectures,"SKIP (Log: ""ARM64 Incompatible"")"
+3,Runtime Support,Only specific runtimes support the EXEC_WRAPPER method safely.,"if Runtime not in ['python3.x', 'node18.x'...]","SKIP (Log: ""Unsupported Runtime"")"
+4,Memory Headroom,Defender agent adds ~30-50MB overhead. Functions with 128MB risk OOM (Out of Memory) crashes.,if MemorySize < 256,"SKIP (Log: ""High Risk - OOM"")"
+5,Timeout Buffer,"AWS Hard Limit is 15 mins. If function runs for 14m 50s, adding 1s latency causes Timeout.",if Timeout > (900 - 30),"SKIP (Log: ""Timeout too close to limit"")"
+6,Env Var Quota,"AWS limits Env Vars to 4KB. If full, adding TW_POLICY causes deployment failure.",if (current_size + new_vars) > 4096,"SKIP (Log: ""Env Var Quota Full"")"
+7,VPC Black Hole,VPC functions without NAT Gateway cannot reach Prisma Console. Defender will hang/timeout.,if VpcConfig and not HasNatGateway,"WARN (Log: ""VPC Detected - Verify NAT"")"
+8,SnapStart Conflict,Java SnapStart freezes the init phase. Modifying layers breaks the snapshot restoration logic.,if SnapStart != 'None',"SKIP (Log: ""SnapStart Enabled"")"
+9,Provisioned Concurrency,"Modifying layers destroys ""Warm"" instances, causing Cold Start spikes and Re-billing.",if ProvisionedConcurrencyConfigs exists,"SKIP (Log: ""Provisioned Concurrency Active"")"
+10,Stability History,"If a function was Throttled recently, it is under stress. We do not touch stressed systems.",if Throttles_24h > 0,"SKIP (Log: ""Unstable - Recently Throttled"")"
