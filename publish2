@@ -1,0 +1,117 @@
+import boto3
+import requests
+import json
+import os
+import zipfile
+import io
+
+# ================= CONFIGURATION =================
+PRISMA_CONSOLE_URL = "https://your-console.twistlock.com" # <--- Update this if needed
+
+# AUTHENTICATION
+ACCESS_KEY_ID = os.environ.get('PRISMA_ACCESS_KEY')
+SECRET_KEY = os.environ.get('PRISMA_SECRET_KEY')
+
+# TARGET REGION (Singapore)
+TARGET_REGIONS = ['ap-southeast-1']
+
+DEFENDER_PAYLOAD = {
+    "provider": "aws",
+    "runtime": "python3.11" 
+}
+
+COMPATIBLE_RUNTIMES = [
+    'python3.8', 'python3.9', 'python3.10', 'python3.11', 'python3.12', 
+    'nodejs16.x', 'nodejs18.x', 'nodejs20.x'
+]
+# =================================================
+
+def get_auth_token(access_key, secret_key):
+    # Strip trailing slash to fix the "Double Slash" error
+    base_url = PRISMA_CONSOLE_URL.rstrip('/')
+    url = f"{base_url}/api/v1/authenticate"
+    
+    print(f"🔐 Authenticating to {base_url}...")
+    try:
+        resp = requests.post(url, json={"username": access_key, "password": secret_key}, verify=True)
+        resp.raise_for_status()
+        return resp.json()['token']
+    except Exception as e:
+        print(f"❌ Authentication Failed: {e}")
+        exit(1)
+
+def get_layer_content(token):
+    print("⬇️  Downloading Serverless Defender Bundle...")
+    base_url = PRISMA_CONSOLE_URL.rstrip('/')
+    url = f"{base_url}/api/v1/defenders/serverless/bundle"
+    headers = {"Authorization": f"Bearer {token}"}
+    
+    try:
+        resp = requests.post(url, headers=headers, json=DEFENDER_PAYLOAD, stream=True)
+        resp.raise_for_status()
+        
+        bundle_bytes = resp.content
+        
+        # --- SMART INSPECTION LOGIC ---
+        try:
+            with zipfile.ZipFile(io.BytesIO(bundle_bytes)) as z:
+                filenames = z.namelist()
+                
+                # Case A: Nested Zip (Legacy Behavior)
+                if "twistlock_defender_layer.zip" in filenames:
+                    print("   ✅ Found nested 'twistlock_defender_layer.zip'. Extracting...")
+                    return z.read("twistlock_defender_layer.zip")
+                
+                # Case B: The Bundle IS the Layer (Modern Behavior)
+                # We check if it contains the 'twistlock/' folder structure
+                is_valid_layer = any(f.startswith("twistlock/") for f in filenames)
+                if is_valid_layer:
+                    print("   ✅ Validated: The downloaded bundle IS the layer.")
+                    return bundle_bytes
+                
+                print("⚠️  Warning: Downloaded zip structure is unexpected.")
+                print(f"   Contents: {filenames[:5]}...")
+                print("   Attempting to upload it anyway...")
+                return bundle_bytes
+                
+        except zipfile.BadZipFile:
+            print("❌ Error: Downloaded content is not a valid zip file.")
+            exit(1)
+
+    except Exception as e:
+        print(f"❌ Download Failed: {e}")
+        exit(1)
+
+def publish_to_aws(layer_content, regions):
+    print("🚀 Publishing Layer to AWS...")
+    
+    for region in regions:
+        print(f"   --- Region: {region} ---")
+        client = boto3.client('lambda', region_name=region)
+        
+        try:
+            response = client.publish_layer_version(
+                LayerName='twistlock-defender',
+                Description='Prisma Cloud Serverless Defender (Universal)',
+                Content={'ZipFile': layer_content},
+                CompatibleRuntimes=COMPATIBLE_RUNTIMES,
+                LicenseInfo='Palo Alto Networks'
+            )
+            
+            layer_arn = response['LayerVersionArn']
+            print(f"   ✅ Published: {layer_arn}")
+            
+        except Exception as e:
+            print(f"   ❌ Failed in {region}: {e}")
+
+def main():
+    if not ACCESS_KEY_ID or not SECRET_KEY:
+        print("❌ Please set PRISMA_ACCESS_KEY and PRISMA_SECRET_KEY env vars.")
+        return
+
+    token = get_auth_token(ACCESS_KEY_ID, SECRET_KEY)
+    layer_content = get_layer_content(token)
+    publish_to_aws(layer_content, TARGET_REGIONS)
+
+if __name__ == '__main__':
+    main()
